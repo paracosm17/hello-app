@@ -180,3 +180,125 @@ jobs:
           docker logs "${container_name}" || true
           printf '%s\n' 'ERROR: immutable GHCR image did not satisfy /healthz contract' >&2
           exit 1
+
+  deploy:
+    name: Deploy immutable image to Coolify
+    if: github.event_name == 'push'
+    needs:
+      - publish
+      - verify-published
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: production
+    concurrency:
+      group: solo-vps-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      IMAGE_REF: ${{ needs.publish.outputs.image_ref }}
+      SOLO_VPS_DEPLOY_HOST: ${{ vars.SOLO_VPS_DEPLOY_HOST }}
+      SOLO_VPS_SSH_KNOWN_HOSTS: ${{ vars.SOLO_VPS_SSH_KNOWN_HOSTS }}
+      SOLO_VPS_DEPLOY_SSH_FINGERPRINT: ${{ vars.SOLO_VPS_DEPLOY_SSH_FINGERPRINT }}
+      COOLIFY_RESOURCE_UUID: ${{ vars.COOLIFY_RESOURCE_UUID }}
+    steps:
+      - name: Check out repository for deployment helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Deploy exact digest through restricted SSH tunnel
+        shell: bash
+        env:
+          SOLO_VPS_DEPLOY_SSH_KEY: ${{ secrets.SOLO_VPS_DEPLOY_SSH_KEY }}
+          COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
+          COOLIFY_API_DEPLOY_CONFIRM: I_HAVE_REVIEWED_THE_LOOPBACK_COOLIFY_API_DEPLOYMENT
+        run: |
+          set -euo pipefail
+          umask 077
+
+          key_path="${RUNNER_TEMP}/solo-vps-ci-deploy-key"
+          public_key_path="${key_path}.pub"
+          known_hosts_path="${RUNNER_TEMP}/solo-vps-known_hosts"
+          ssh_pid=""
+
+          cleanup() {
+            if [[ -n "${ssh_pid}" ]] && kill -0 "${ssh_pid}" 2>/dev/null; then
+              kill "${ssh_pid}" 2>/dev/null || true
+              wait "${ssh_pid}" 2>/dev/null || true
+            fi
+            rm -f "${key_path}" "${public_key_path}" "${known_hosts_path}"
+          }
+          trap cleanup EXIT
+
+          [[ "${IMAGE_REF}" =~ ^ghcr\.io/[a-z0-9_.-]+/[a-z0-9_.-]+@sha256:[0-9a-f]{64}$ ]]
+          [[ "${SOLO_VPS_DEPLOY_HOST}" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "${COOLIFY_RESOURCE_UUID}" =~ ^[a-z0-9]{8,64}$ ]]
+          [[ "${SOLO_VPS_DEPLOY_SSH_FINGERPRINT}" =~ ^SHA256:[A-Za-z0-9+/]+$ ]]
+          [[ -n "${SOLO_VPS_DEPLOY_SSH_KEY}" ]]
+          [[ -n "${COOLIFY_API_TOKEN}" ]]
+          [[ "${SOLO_VPS_SSH_KNOWN_HOSTS}" != *$'\n'* ]]
+
+          read -r known_host known_type known_key known_extra <<< "${SOLO_VPS_SSH_KNOWN_HOSTS}"
+          [[ "${known_host}" == "${SOLO_VPS_DEPLOY_HOST}" ]]
+          [[ "${known_type}" == 'ssh-ed25519' ]]
+          [[ "${known_key}" =~ ^AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/=]+$ ]]
+          [[ -z "${known_extra:-}" ]]
+
+          printf '%s\n' "${SOLO_VPS_DEPLOY_SSH_KEY}" | tr -d '\r' > "${key_path}"
+          printf '%s\n' "${SOLO_VPS_SSH_KNOWN_HOSTS}" > "${known_hosts_path}"
+          chmod 600 "${key_path}" "${known_hosts_path}"
+
+          ssh-keygen -y -P '' -f "${key_path}" > "${public_key_path}"
+          actual_fingerprint="$(ssh-keygen -lf "${public_key_path}" -E sha256 | awk '{print $2}')"
+          [[ "${actual_fingerprint}" == "${SOLO_VPS_DEPLOY_SSH_FINGERPRINT}" ]]
+
+          ssh -F /dev/null -N -T \
+            -o BatchMode=yes \
+            -o PreferredAuthentications=publickey \
+            -o PasswordAuthentication=no \
+            -o KbdInteractiveAuthentication=no \
+            -o IdentitiesOnly=yes \
+            -o IdentityFile="${key_path}" \
+            -o UserKnownHostsFile="${known_hosts_path}" \
+            -o GlobalKnownHostsFile=/dev/null \
+            -o StrictHostKeyChecking=yes \
+            -o HostKeyAlgorithms=ssh-ed25519 \
+            -o ExitOnForwardFailure=yes \
+            -o ForwardAgent=no \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -L 127.0.0.1:18000:127.0.0.1:8000 \
+            "solo-vps-ci@${SOLO_VPS_DEPLOY_HOST}" &
+          ssh_pid=$!
+
+          tunnel_ready=0
+          for attempt in {1..30}; do
+            if ! kill -0 "${ssh_pid}" 2>/dev/null; then
+              wait "${ssh_pid}" || true
+              printf '%s\n' 'ERROR: restricted SSH tunnel exited before Coolify became reachable' >&2
+              exit 1
+            fi
+            if response="$(curl --fail --silent --show-error --max-time 2 http://127.0.0.1:18000/api/health 2>/dev/null)" \
+              && [[ "${response}" == 'OK' ]]; then
+              printf 'Restricted Coolify tunnel ready on attempt %s.\n' "${attempt}"
+              tunnel_ready=1
+              break
+            fi
+            sleep 1
+          done
+          [[ "${tunnel_ready}" == '1' ]]
+
+          python3 scripts/coolify_deploy_api.py \
+            --base-url http://127.0.0.1:18000/api/v1 \
+            --resource-uuid "${COOLIFY_RESOURCE_UUID}" \
+            --image-ref "${IMAGE_REF}" \
+            --check
+
+          python3 scripts/coolify_deploy_api.py \
+            --base-url http://127.0.0.1:18000/api/v1 \
+            --resource-uuid "${COOLIFY_RESOURCE_UUID}" \
+            --image-ref "${IMAGE_REF}" \
+            --apply \
+            --poll-timeout 180 \
+            --poll-interval 2
