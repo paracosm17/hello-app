@@ -28,6 +28,9 @@ jobs:
       - name: Run application tests
         run: python3 -m unittest discover -s "${APP_DIR}" -p 'test_*.py'
 
+      - name: Run deployment helper contract tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+
   build:
     name: Build pull request image
     if: github.event_name == 'pull_request'

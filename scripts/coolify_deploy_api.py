@@ -6,6 +6,7 @@ The script is intentionally constrained to the Solo VPS management contract:
 - the only alternate client endpoint is the fixed runner-side SSH tunnel at 127.0.0.1:18000;
 - the target must already be a Docker Image application;
 - the image identity must be an immutable public GHCR sha256 digest;
+- mutation requires an existing immutable desired digest so failed/unhealthy candidates can be restored automatically;
 - mutation requires an explicit --apply flag, confirmation environment value, and bearer token supplied out of band.
 
 This is an M11 control-plane proof helper, not a general Coolify client.
@@ -17,6 +18,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sys
 import time
 from dataclasses import dataclass
@@ -35,11 +37,74 @@ SSH_TUNNEL_BASE_URL = "http://127.0.0.1:18000/api/v1"
 APPLY_CONFIRMATION = "I_HAVE_REVIEWED_THE_LOOPBACK_COOLIFY_API_DEPLOYMENT"
 _ALLOWED_BASE_URLS = {DEFAULT_BASE_URL, SSH_TUNNEL_BASE_URL}
 _RESOURCE_UUID_RE = re.compile(r"^[a-z0-9]{8,64}$")
+_COOLIFY_DIGEST_TAG_RE = re.compile(r"^sha256-([0-9a-f]{64})$")
 _TERMINAL_DEPLOYMENT_STATUSES = {"finished", "failed", "cancelled-by-user"}
 
 
 class CoolifyDeployError(RuntimeError):
     """Fail-closed error for an unsafe or unsuccessful deployment operation."""
+
+
+@dataclass(frozen=True)
+class ImmutableImageState:
+    image_name: str
+    image_tag: str
+
+    @property
+    def image_ref(self) -> str:
+        match = _COOLIFY_DIGEST_TAG_RE.fullmatch(self.image_tag)
+        if match is None:
+            raise CoolifyDeployError("Coolify image state is not an immutable sha256 digest")
+        return f"{self.image_name}@sha256:{match.group(1)}"
+
+    @property
+    def update_payload(self) -> dict[str, str]:
+        return {
+            "docker_registry_image_name": self.image_name,
+            "docker_registry_image_tag": self.image_tag,
+        }
+
+
+class DeploymentRollbackError(CoolifyDeployError):
+    """Deployment failed after mutation; automatic rollback was attempted."""
+
+    def __init__(
+        self,
+        *,
+        outcome: str,
+        candidate_image_ref: str,
+        previous_image_ref: str,
+        deployment_error: str,
+        rollback_error: str = "",
+        recovery_command: str = "",
+    ) -> None:
+        self.outcome = outcome
+        self.candidate_image_ref = candidate_image_ref
+        self.previous_image_ref = previous_image_ref
+        self.deployment_error = deployment_error
+        self.rollback_error = rollback_error
+        self.recovery_command = recovery_command
+        message = (
+            f"{outcome}: candidate={candidate_image_ref}; previous={previous_image_ref}; "
+            f"deploy_error={deployment_error}"
+        )
+        if rollback_error:
+            message += f"; rollback_error={rollback_error}"
+        super().__init__(message)
+
+    def as_dict(self) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "status": "ERROR",
+            "outcome": self.outcome,
+            "candidate_image_ref": self.candidate_image_ref,
+            "previous_image_ref": self.previous_image_ref,
+            "deployment_error": self.deployment_error,
+        }
+        if self.rollback_error:
+            value["rollback_error"] = self.rollback_error
+        if self.recovery_command:
+            value["recovery_command"] = self.recovery_command
+        return value
 
 
 @dataclass(frozen=True)
@@ -60,7 +125,7 @@ class DeploymentPlan:
 
     @property
     def update_payload(self) -> dict[str, str]:
-        # The owner-target v4.1.2 proof established that this General-form pair
+        # The integration v4.1.2 proof established that this General-form pair
         # reconstructs repository@sha256:<digest> without the creation-UI double marker.
         return {
             "docker_registry_image_name": self.handoff.preferred_ui_image_name,
@@ -157,10 +222,38 @@ def validate_application_state(application: dict[str, Any], plan: DeploymentPlan
         )
 
 
-def validate_persisted_image_state(application: dict[str, Any], plan: DeploymentPlan) -> None:
+def candidate_image_state(plan: DeploymentPlan) -> ImmutableImageState:
+    return ImmutableImageState(
+        image_name=plan.handoff.preferred_ui_image_name,
+        image_tag=plan.handoff.preferred_ui_image_tag,
+    )
+
+
+def capture_previous_image_state(application: dict[str, Any], plan: DeploymentPlan) -> ImmutableImageState:
     validate_application_state(application, plan)
-    expected_name = plan.handoff.preferred_ui_image_name
-    expected_tag = plan.handoff.preferred_ui_image_tag
+    image_name = _clean_optional(application.get("docker_registry_image_name"))
+    image_tag = _clean_optional(application.get("docker_registry_image_tag"))
+    if not image_name or not image_tag:
+        raise CoolifyDeployError(
+            "target application must already have a known-good immutable Docker Image before automatic rollback is safe"
+        )
+    if _COOLIFY_DIGEST_TAG_RE.fullmatch(image_tag) is None:
+        raise CoolifyDeployError(
+            "target application's current desired image must use Coolify sha256-<digest> form before mutation; "
+            "mutable previous state cannot be used as an automatic rollback target"
+        )
+    return ImmutableImageState(image_name=image_name, image_tag=image_tag)
+
+
+def validate_persisted_image_state(
+    application: dict[str, Any],
+    plan: DeploymentPlan,
+    expected: ImmutableImageState | None = None,
+) -> None:
+    validate_application_state(application, plan)
+    state = expected or candidate_image_state(plan)
+    expected_name = state.image_name
+    expected_tag = state.image_tag
     if _clean_optional(application.get("docker_registry_image_name")) != expected_name:
         raise CoolifyDeployError("Coolify did not persist the expected Docker Image repository")
     if _clean_optional(application.get("docker_registry_image_tag")) != expected_tag:
@@ -230,6 +323,108 @@ def check_application(client: CoolifyApiClient, plan: DeploymentPlan) -> dict[st
     return application
 
 
+def _deploy_exact_image(
+    client: CoolifyApiClient,
+    plan: DeploymentPlan,
+    desired: ImmutableImageState,
+    *,
+    operation: str,
+    poll_interval: float,
+    poll_timeout: float,
+    sleeper: Callable[[float], None],
+    monotonic: Callable[[], float],
+) -> dict[str, Any]:
+    update_response = client.request("PATCH", plan.application_url, desired.update_payload)
+    if _clean_optional(update_response.get("uuid")) != plan.resource_uuid:
+        raise CoolifyDeployError(f"Coolify {operation} update response did not confirm the target application UUID")
+
+    persisted = client.request("GET", plan.application_url)
+    validate_persisted_image_state(persisted, plan, desired)
+
+    start_response = client.request("POST", plan.start_url)
+    deployment_uuid = _clean_optional(start_response.get("deployment_uuid"))
+    if not deployment_uuid or not _RESOURCE_UUID_RE.fullmatch(deployment_uuid):
+        raise CoolifyDeployError(f"Coolify {operation} start response did not include a valid deployment_uuid")
+
+    deadline = monotonic() + poll_timeout
+    deployment: dict[str, Any] = {}
+    while True:
+        deployment = client.request("GET", plan.deployment_url(deployment_uuid))
+        status = _clean_optional(deployment.get("status"))
+        if status in _TERMINAL_DEPLOYMENT_STATUSES:
+            break
+        if status not in {"queued", "in_progress"}:
+            raise CoolifyDeployError(f"unexpected Coolify {operation} deployment status: {status or '<empty>'}")
+        if monotonic() >= deadline:
+            raise CoolifyDeployError(
+                f"timed out waiting for {operation} deployment {deployment_uuid}; last status={status}"
+            )
+        sleeper(poll_interval)
+
+    if _clean_optional(deployment.get("status")) != "finished":
+        raise CoolifyDeployError(
+            f"Coolify {operation} deployment {deployment_uuid} ended with "
+            f"status={_clean_optional(deployment.get('status'))}"
+        )
+
+    health_deadline = monotonic() + poll_timeout
+    app_status = ""
+    while True:
+        after = client.request("GET", plan.application_url)
+        validate_persisted_image_state(after, plan, desired)
+        app_status = _clean_optional(after.get("status"))
+        if app_status == "running:healthy":
+            break
+        if app_status.startswith(("exited", "stopped", "dead", "failed")) or app_status == "running:unhealthy":
+            raise CoolifyDeployError(
+                f"application did not become healthy after {operation} deployment: status={app_status}"
+            )
+        if monotonic() >= health_deadline:
+            raise CoolifyDeployError(
+                f"timed out waiting for application health after {operation} deployment {deployment_uuid}; "
+                f"last status={app_status or '<empty>'}"
+            )
+        sleeper(poll_interval)
+
+    return {
+        "deployment_uuid": deployment_uuid,
+        "deployment_status": "finished",
+        "application_status": app_status or "not-reported",
+    }
+
+
+def _recovery_command(
+    plan: DeploymentPlan,
+    previous: ImmutableImageState,
+    *,
+    poll_interval: float,
+    poll_timeout: float,
+) -> str:
+    # Incident recovery is intentionally rendered for execution *on the VPS* so it
+    # does not depend on a GitHub runner's transient 127.0.0.1:18000 SSH tunnel.
+    args = [
+        "python3",
+        "scripts/coolify_deploy_api.py",
+        "--base-url",
+        DEFAULT_BASE_URL,
+        "--resource-uuid",
+        plan.resource_uuid,
+        "--image-ref",
+        previous.image_ref,
+        "--expected-port",
+        plan.expected_port,
+        "--recover-known-good",
+        "--poll-timeout",
+        str(poll_timeout),
+        "--poll-interval",
+        str(poll_interval),
+    ]
+    if plan.allow_domain:
+        args.append("--allow-domain")
+    command = " ".join(shlex.quote(part) for part in args)
+    return f"COOLIFY_API_DEPLOY_CONFIRM={APPLY_CONFIRMATION} {command}"
+
+
 def apply_deployment(
     client: CoolifyApiClient,
     plan: DeploymentPlan,
@@ -240,66 +435,98 @@ def apply_deployment(
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     before = check_application(client, plan)
+    previous = capture_previous_image_state(before, plan)
+    candidate = candidate_image_state(plan)
 
-    update_response = client.request("PATCH", plan.application_url, plan.update_payload)
-    if _clean_optional(update_response.get("uuid")) != plan.resource_uuid:
-        raise CoolifyDeployError("Coolify update response did not confirm the target application UUID")
-
-    persisted = client.request("GET", plan.application_url)
-    validate_persisted_image_state(persisted, plan)
-
-    start_response = client.request("POST", plan.start_url)
-    deployment_uuid = _clean_optional(start_response.get("deployment_uuid"))
-    if not deployment_uuid or not _RESOURCE_UUID_RE.fullmatch(deployment_uuid):
-        raise CoolifyDeployError("Coolify start response did not include a valid deployment_uuid")
-
-    deadline = monotonic() + poll_timeout
-    deployment: dict[str, Any] = {}
-    while True:
-        deployment = client.request("GET", plan.deployment_url(deployment_uuid))
-        status = _clean_optional(deployment.get("status"))
-        if status in _TERMINAL_DEPLOYMENT_STATUSES:
-            break
-        if status not in {"queued", "in_progress"}:
-            raise CoolifyDeployError(f"unexpected Coolify deployment status: {status or '<empty>'}")
-        if monotonic() >= deadline:
-            raise CoolifyDeployError(
-                f"timed out waiting for deployment {deployment_uuid}; last status={status}"
-            )
-        sleeper(poll_interval)
-
-    if _clean_optional(deployment.get("status")) != "finished":
-        raise CoolifyDeployError(
-            f"Coolify deployment {deployment_uuid} ended with status={_clean_optional(deployment.get('status'))}"
+    try:
+        candidate_result = _deploy_exact_image(
+            client,
+            plan,
+            candidate,
+            operation="candidate",
+            poll_interval=poll_interval,
+            poll_timeout=poll_timeout,
+            sleeper=sleeper,
+            monotonic=monotonic,
         )
+    except CoolifyDeployError as deployment_error:
+        try:
+            rollback_result = _deploy_exact_image(
+                client,
+                plan,
+                previous,
+                operation="rollback",
+                poll_interval=poll_interval,
+                poll_timeout=poll_timeout,
+                sleeper=sleeper,
+                monotonic=monotonic,
+            )
+        except CoolifyDeployError as rollback_error:
+            raise DeploymentRollbackError(
+                outcome="DEPLOY_FAILED_ROLLBACK_FAILED",
+                candidate_image_ref=candidate.image_ref,
+                previous_image_ref=previous.image_ref,
+                deployment_error=str(deployment_error),
+                rollback_error=str(rollback_error),
+                recovery_command=_recovery_command(
+                    plan,
+                    previous,
+                    poll_interval=poll_interval,
+                    poll_timeout=poll_timeout,
+                ),
+            ) from rollback_error
 
-    health_deadline = monotonic() + poll_timeout
-    app_status = ""
-    while True:
-        after = client.request("GET", plan.application_url)
-        validate_persisted_image_state(after, plan)
-        app_status = _clean_optional(after.get("status"))
-        if app_status == "running:healthy":
-            break
-        if app_status.startswith(("exited", "stopped", "dead", "failed")) or app_status == "running:unhealthy":
-            raise CoolifyDeployError(
-                f"application did not become healthy after finished deployment: status={app_status}"
-            )
-        if monotonic() >= health_deadline:
-            raise CoolifyDeployError(
-                f"timed out waiting for application health after deployment {deployment_uuid}; "
-                f"last status={app_status or '<empty>'}"
-            )
-        sleeper(poll_interval)
+        raise DeploymentRollbackError(
+            outcome="DEPLOY_FAILED_ROLLBACK_OK",
+            candidate_image_ref=candidate.image_ref,
+            previous_image_ref=previous.image_ref,
+            deployment_error=str(deployment_error),
+        ) from deployment_error
 
     return {
         "resource_uuid": plan.resource_uuid,
-        "deployment_uuid": deployment_uuid,
-        "image_ref": plan.handoff.image_ref,
-        "deployment_status": "finished",
-        "application_status": app_status or "not-reported",
-        "previous_image_name": _clean_optional(before.get("docker_registry_image_name")),
-        "previous_image_tag": _clean_optional(before.get("docker_registry_image_tag")),
+        "deployment_uuid": candidate_result["deployment_uuid"],
+        "image_ref": candidate.image_ref,
+        "deployment_status": candidate_result["deployment_status"],
+        "application_status": candidate_result["application_status"],
+        "previous_image_ref": previous.image_ref,
+        "previous_image_name": previous.image_name,
+        "previous_image_tag": previous.image_tag,
+        "rollback_attempted": False,
+    }
+
+
+def recover_known_good(
+    client: CoolifyApiClient,
+    plan: DeploymentPlan,
+    *,
+    poll_interval: float = 2.0,
+    poll_timeout: float = 180.0,
+    sleeper: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    # This is an explicit incident path for the exact immutable image printed by
+    # DEPLOY_FAILED_ROLLBACK_FAILED. It intentionally does not roll back again to
+    # the currently persisted (possibly bad) desired state if recovery itself fails.
+    check_application(client, plan)
+    desired = candidate_image_state(plan)
+    result = _deploy_exact_image(
+        client,
+        plan,
+        desired,
+        operation="known-good recovery",
+        poll_interval=poll_interval,
+        poll_timeout=poll_timeout,
+        sleeper=sleeper,
+        monotonic=monotonic,
+    )
+    return {
+        "resource_uuid": plan.resource_uuid,
+        "deployment_uuid": result["deployment_uuid"],
+        "image_ref": desired.image_ref,
+        "deployment_status": result["deployment_status"],
+        "application_status": result["application_status"],
+        "recovery_mode": "known-good-no-nested-rollback",
     }
 
 
@@ -316,7 +543,8 @@ def _print_plan(plan: DeploymentPlan, as_json: bool) -> None:
     print("  required_token_permissions: read, write, deploy")
     print("  update_payload:")
     print(json.dumps(plan.update_payload, indent=4, sort_keys=True))
-    print("  mutation: disabled unless --apply is supplied")
+    print("  rollback: --apply requires and restores the previous immutable desired digest on failure")
+    print("  mutation: disabled unless --apply or --recover-known-good is supplied")
 
 
 def main() -> int:
@@ -334,7 +562,16 @@ def main() -> int:
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="Read and validate the target application without mutation.")
-    mode.add_argument("--apply", action="store_true", help="PATCH exact digest, start deployment, and poll to completion.")
+    mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="PATCH exact digest, deploy, and automatically restore the previous immutable digest on failure.",
+    )
+    mode.add_argument(
+        "--recover-known-good",
+        action="store_true",
+        help="Incident-only: deploy the supplied immutable image without nested rollback to current desired state.",
+    )
     parser.add_argument("--poll-timeout", type=float, default=180.0)
     parser.add_argument("--poll-interval", type=float, default=2.0)
     parser.add_argument("--json", action="store_true")
@@ -350,11 +587,11 @@ def main() -> int:
             expected_port=args.expected_port,
             allow_domain=args.allow_domain,
         )
-        if not args.check and not args.apply:
+        if not args.check and not args.apply and not args.recover_known_good:
             _print_plan(plan, args.json)
             return 0
 
-        if args.apply:
+        if args.apply or args.recover_known_good:
             require_apply_confirmation()
         token = load_token_from_environment()
         client = CoolifyApiClient(token)
@@ -372,10 +609,20 @@ def main() -> int:
                 "docker_registry_image_tag": _clean_optional(application.get("docker_registry_image_tag")),
                 "application_status": _clean_optional(application.get("status")),
             }
-        else:
+        elif args.apply:
             evidence = {"status": "PASS", "mode": "apply"}
             evidence.update(
                 apply_deployment(
+                    client,
+                    plan,
+                    poll_interval=args.poll_interval,
+                    poll_timeout=args.poll_timeout,
+                )
+            )
+        else:
+            evidence = {"status": "PASS", "mode": "recover-known-good"}
+            evidence.update(
+                recover_known_good(
                     client,
                     plan,
                     poll_interval=args.poll_interval,
@@ -386,12 +633,32 @@ def main() -> int:
         if args.json:
             print(json.dumps(evidence, indent=2, sort_keys=True))
         else:
-            label = "check" if args.check else "deployment"
+            if args.check:
+                label = "check"
+            elif args.recover_known_good:
+                label = "known-good recovery"
+            else:
+                label = "deployment"
             print(f"PASS Coolify loopback deploy API {label}")
             for key, value in evidence.items():
                 if key not in {"status", "mode"}:
                     print(f"  {key}: {value}")
         return 0
+    except DeploymentRollbackError as exc:
+        if args.json:
+            print(json.dumps(exc.as_dict(), indent=2, sort_keys=True), file=sys.stderr)
+        else:
+            print("ERROR Coolify loopback deploy API transaction", file=sys.stderr)
+            for key, value in exc.as_dict().items():
+                if key != "status":
+                    print(f"  {key}: {value}", file=sys.stderr)
+            if exc.outcome == "DEPLOY_FAILED_ROLLBACK_FAILED":
+                print(
+                    "  recovery_note: run recovery_command on the VPS only after exporting a reviewed short-lived "
+                    "COOLIFY_API_TOKEN; do not put the token on the command line.",
+                    file=sys.stderr,
+                )
+        return 3 if exc.outcome == "DEPLOY_FAILED_ROLLBACK_FAILED" else 2
     except CoolifyDeployError as exc:
         print(f"ERROR Coolify loopback deploy API: {exc}", file=sys.stderr)
         return 2
